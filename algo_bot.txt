@@ -1,0 +1,328 @@
+#property copyright "NIL"
+#property version   "1.0"
+#property strict
+
+//--- Inputs for Moving Averages
+input int Fast_MA_Period = 10;          // Fast MA period
+input int Slow_MA_Period = 20;          // Slow MA period
+input ENUM_MA_METHOD MA_Method = MODE_SMA; // MA Method (SMA by default)
+input ENUM_APPLIED_PRICE Applied_Price = PRICE_CLOSE; // Applied price
+
+double LotSizes[] = {0.01, 0.02, 0.02, 0.03, 0.05, 0.08, 0.12, 0.17, 0.23}; // Fixed lot size sequence
+
+input double Loss_Threshold_Pips = 25;  // Loss Threshold in pips
+input double Take_Profit_Pips = 25;  
+//--- Global Variables
+datetime lastBarTime = 0;               // Tracks the last bar's time
+bool closingTrades = false;             // Prevents trades during closing process
+
+
+
+//+------------------------------------------------------------------+
+//| Helper Function: Get Moving Average Value                        |
+//+------------------------------------------------------------------+
+double GetMAValue(int maPeriod) {
+    int maHandle = iMA(_Symbol, PERIOD_M15, maPeriod, 0, MA_Method, Applied_Price);
+    if (maHandle == INVALID_HANDLE) {
+        Print("Error creating MA handle. Error: ", GetLastError());
+        return -1;
+    }
+
+    double maValues[];
+    if (CopyBuffer(maHandle, 0, 0, 1, maValues) <= 0) {
+        Print("Error copying MA buffer. Error: ", GetLastError());
+        IndicatorRelease(maHandle);
+        return -1;
+    }
+
+    IndicatorRelease(maHandle);
+    return maValues[0];
+}
+
+
+
+datetime lastTradeTime = 0; 
+//+------------------------------------------------------------------+
+//| OnTick Logic with MA Crossover                                   |
+//+------------------------------------------------------------------+
+void OnTick() {
+    // Prevent trade logic while closing trades
+    if (closingTrades) return;
+
+    // Check if there are any open trades
+    int tradeCount = CountSymbolTrades();
+
+    // If there are open trades, check cumulative profit to close all trades
+    if (tradeCount > 0) {
+        double cumulativeProfitPips = CalculateCumulativeProfit();
+        double profitThresholdPips = CalculateThresholdPips(tradeCount, Take_Profit_Pips);
+
+        if (cumulativeProfitPips >= profitThresholdPips) {
+            Print("Cumulative profit exceeded threshold. Closing all trades.");
+            closingTrades = true; // Set flag to prevent new trades
+            CloseAllTrades();     // Close all trades
+            closingTrades = false; // Reset flag after completion
+            return;               // Stop further execution
+        }
+    }
+
+    // Loss-based logic and 15-minute interval enforcement
+    datetime currentBarTime = iTime(_Symbol, PERIOD_M15, 0);
+    if (lastBarTime == currentBarTime) return; // Exit if we're still on the same bar
+    lastBarTime = currentBarTime;              // Update to the new bar
+
+    // Ensure trades are only executed on the start of a 15-minute interval
+    if ((TimeCurrent() - currentBarTime) < 0) return; // Wait until the start of the next M15 bar
+
+    // First trade placement logic using MA Crossover
+    if (tradeCount == 0) { // No trades currently open
+        double fastMA = GetMAValue(Fast_MA_Period);
+        double slowMA = GetMAValue(Slow_MA_Period);
+
+        if (fastMA < 0 || slowMA < 0) return; // Ensure MA values are valid
+
+        // Check for crossover signals
+        if (fastMA > slowMA) {
+            Print("Fast MA crossed above Slow MA. Opening BUY trade.");
+            OpenTrade(ORDER_TYPE_BUY, LotSizes[0]);
+            lastTradeTime = TimeCurrent(); // Record trade time
+        } else if (fastMA < slowMA) {
+            Print("Fast MA crossed below Slow MA. Opening SELL trade.");
+            OpenTrade(ORDER_TYPE_SELL, LotSizes[0]);
+            lastTradeTime = TimeCurrent(); // Record trade time
+        }
+        return; // Stop further processing since the first trade is placed
+    }
+
+    // Loss-based logic for subsequent trades
+    if (tradeCount > 0) {
+        ulong lastTradeTicket = GetLastTradeTicket();
+        if (lastTradeTicket == 0) {
+            Print("Error: Unable to retrieve the last trade ticket.");
+            return;
+        }
+
+        double lastTradeLossPips = CalculateProfitInPips(lastTradeTicket);
+        double lossThresholdPips = CalculateThresholdPips(tradeCount, Loss_Threshold_Pips);
+
+        Print("Last trade loss (pips): ", lastTradeLossPips);
+        Print("Loss threshold (pips): ", lossThresholdPips);
+
+        if (lastTradeLossPips < 0 && MathAbs(lastTradeLossPips) > lossThresholdPips) {
+            ENUM_ORDER_TYPE firstOrderType = GetFirstTradeType();
+            if (firstOrderType == -1) {
+                Print("Error: Unable to determine the type of the first trade.");
+                return;
+            }
+
+            double nextLot = (tradeCount < ArraySize(LotSizes)) ? LotSizes[tradeCount] : LotSizes[ArraySize(LotSizes) - 1];
+            OpenTrade(firstOrderType, nextLot);
+            lastTradeTime = TimeCurrent(); // Update trade time
+        }
+    }
+
+}
+
+
+//+------------------------------------------------------------------+
+//| Calculate Total threashold pips                                  |
+//+------------------------------------------------------------------+
+double CalculateThresholdPips(int tradeCount, double thresholdPips) {
+    double lotSum = 0.0; // Initialize the sum of lot sizes
+
+    // Loop through the trade count to sum lot sizes from the sequence
+    for (int i = 0; i < tradeCount; i++) {
+        if (i < ArraySize(LotSizes)) { // Ensure we don't exceed the array size
+            lotSum += LotSizes[i];
+        } else {
+            // Use the last lot size in the sequence if tradeCount exceeds the array size
+            lotSum += LotSizes[ArraySize(LotSizes) - 1];
+        }
+    }
+
+    // Calculate the threshold in pips
+    double threshold = lotSum * 100 * thresholdPips;
+    return threshold;
+}
+
+
+ENUM_ORDER_TYPE GetFirstTradeType() {
+    // Loop through all open positions
+    for (int i = 0; i < PositionsTotal(); i++) {
+        if (PositionSelect(PositionGetSymbol(i)) &&
+            PositionGetInteger(POSITION_MAGIC) == 123456) { // Only consider trades with the same magic number
+            int firstTradeType = (int)PositionGetInteger(POSITION_TYPE); // Get the type of the first trade
+            return (ENUM_ORDER_TYPE)firstTradeType;
+        }
+    }
+    return (ENUM_ORDER_TYPE)-1; // Return -1 if no trade is found
+}
+
+ulong GetLastTradeTicket() {
+    ulong lastTicket = 0;
+    datetime latestTime = 0;
+
+    for (int i = 0; i < PositionsTotal(); i++) {
+        if (PositionSelect(PositionGetSymbol(i)) &&
+            PositionGetInteger(POSITION_MAGIC) == 123456) { // Match the magic number
+            datetime tradeTime = PositionGetInteger(POSITION_TIME);
+            if (tradeTime > latestTime) {
+                latestTime = tradeTime;
+                lastTicket = PositionGetInteger(POSITION_TICKET);
+            }
+        }
+    }
+
+    return lastTicket;
+}
+
+
+
+
+//+------------------------------------------------------------------+
+//| Calculate Cumulative Profit in Pips                              |
+//+------------------------------------------------------------------+
+double CalculateCumulativeProfit() {
+   double totalProfitPips = 0;
+   for (int i = 0; i < PositionsTotal(); i++) {
+      if (PositionSelect(PositionGetSymbol(i)) &&
+          PositionGetInteger(POSITION_MAGIC) == 123456) { // Replace with your magic number
+         totalProfitPips += CalculateProfitInPips(PositionGetInteger(POSITION_TICKET));
+      }
+   }
+   return totalProfitPips;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Cumulative Loss in Pips                                |
+//+------------------------------------------------------------------+
+double CalculateCumulativeLoss() {
+   double totalLossPips = 0;
+   for (int i = 0; i < PositionsTotal(); i++) {
+      if (PositionSelect(PositionGetSymbol(i)) &&
+          PositionGetInteger(POSITION_MAGIC) == 123456) { // Replace with your magic number
+         double profitPips = CalculateProfitInPips(PositionGetInteger(POSITION_TICKET));
+         if (profitPips < 0) totalLossPips += MathAbs(profitPips);
+      }
+   }
+   return totalLossPips;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Profit in Pips                                         |
+//+------------------------------------------------------------------+
+double CalculateProfitInPips(ulong positionTicket) {
+   if (!PositionSelectByTicket(positionTicket)) return 0;
+
+   double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+   int positionType = (int)PositionGetInteger(POSITION_TYPE);
+
+   if (positionType == POSITION_TYPE_BUY) {
+      return (currentPrice - entryPrice) / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   } else {
+      return (entryPrice - currentPrice) / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Count Symbol Trades                                              |
+//+------------------------------------------------------------------+
+int CountSymbolTrades() {
+   int count = 0;
+   for (int i = 0; i < PositionsTotal(); i++) {
+      if (PositionSelect(PositionGetSymbol(i)) &&
+          PositionGetInteger(POSITION_MAGIC) == 123456) { // Replace with your magic number
+         count++;
+      }
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| Open a Trade                                                     |
+//+------------------------------------------------------------------+
+void OpenTrade(int type, double lotSize) {
+   MqlTradeRequest request;
+   MqlTradeResult result;
+   ZeroMemory(request);
+   ZeroMemory(result);
+
+   // Check if trading is enabled for the symbol
+   if (SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_FULL) {
+      Print("Trading is disabled for the symbol: ", _Symbol);
+      return;
+   }
+
+   request.action = TRADE_ACTION_DEAL;
+   request.symbol = _Symbol;
+   request.volume = lotSize;
+   request.type = (ENUM_ORDER_TYPE)type;
+   request.price = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   request.sl = 0; // Stop Loss
+   request.tp = 0; // Take Profit
+   request.deviation = 10; // Adjust this value as per broker settings
+   request.magic = 123456;
+   request.comment = "Martingale EA";
+
+   if (!OrderSend(request, result)) {
+      Print("OrderSend failed. Error: ", GetLastError());
+      if (GetLastError() == 4752) {
+         Print("Possible issue: Trading is disabled for this symbol or account.");
+      }
+   } else {
+      Print("Trade opened successfully. Lot Size: ", lotSize, ", Type: ", type);
+   }
+}
+//+------------------------------------------------------------------+
+//| Close All Trades                                                 |
+//+------------------------------------------------------------------+
+void CloseAllTrades() {
+    bool allClosed = true; // Track whether all trades were successfully closed
+
+    // Loop through all open positions
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        if (PositionSelect(PositionGetSymbol(i)) &&
+            PositionGetInteger(POSITION_MAGIC) == 123456) { // Only close trades with matching magic number
+
+            ulong positionTicket = PositionGetInteger(POSITION_TICKET); // Get the ticket of the position
+            int positionType = (int)PositionGetInteger(POSITION_TYPE); // Get the type (BUY/SELL)
+            double volume = PositionGetDouble(POSITION_VOLUME); // Get the trade volume
+            double closePrice = (positionType == POSITION_TYPE_BUY)
+                                ? SymbolInfoDouble(_Symbol, SYMBOL_BID) // For BUY, close at Bid price
+                                : SymbolInfoDouble(_Symbol, SYMBOL_ASK); // For SELL, close at Ask price
+
+            MqlTradeRequest request;
+            MqlTradeResult result;
+            ZeroMemory(request);
+            ZeroMemory(result);
+
+            // Prepare the close request
+            request.action = TRADE_ACTION_DEAL;
+            request.position = positionTicket; // Ticket of the position to close
+            request.symbol = _Symbol;
+            request.volume = volume; // Full volume to close
+            request.type = (positionType == POSITION_TYPE_BUY)
+                           ? ORDER_TYPE_SELL // For BUY, use SELL to close
+                           : ORDER_TYPE_BUY; // For SELL, use BUY to close
+            request.price = closePrice; // Use the appropriate close price
+            request.deviation = 10; // Slippage tolerance
+            request.magic = 123456;
+
+            // Send the close request
+            if (!OrderSend(request, result)) {
+                Print("Failed to close trade. Ticket: ", positionTicket, ". Error: ", GetLastError());
+                allClosed = false; // Mark failure to close trade
+            } else {
+                Print("Trade closed successfully. Ticket: ", positionTicket);
+            }
+        }
+    }
+
+    // If not all trades were closed, retry after a short delay
+    if (!allClosed) {
+        Print("Not all trades could be closed. Retrying...");
+        Sleep(500); // Brief pause to allow the system to process
+        CloseAllTrades(); // Retry to close remaining trades
+    }
+}
